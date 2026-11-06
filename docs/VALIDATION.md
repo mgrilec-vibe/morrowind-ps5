@@ -36,6 +36,24 @@ Original textures, 1080p, 4096-unit view distance, VSync and a 60 FPS engine cap
 
 Earlier measurements were approximately 30 FPS in a stationary exterior scene. A previous indoor/outdoor transition ran at about 20 FPS after returning outside; lighter interior views reached about 60 FPS. These measurements do not establish a locked 60 FPS result or a performance improvement from the optional mod.
 
+## Scanout color-order correction
+
+The native runtime now registers the RGBA scanout buffers with VideoOut format `0x8000000022000000`. The source evidence and its limits are in [SCANOUT-COLOR-ORDER.md](SCANOUT-COLOR-ORDER.md). This correction has not been tested on a PS5.
+
+To rebuild the release, follow the full compile and package sequence in [BUILDING.md](BUILDING.md), including `python3 tools/build-draw-batching-driver.py`, `python3 tools/compile-openmw.py`, and `python3 tools/pack-openmw.py --out build/package`. Deploy the rebuilt title to the console and launch it.
+
+Use the same game data and settings for the old and rebuilt titles. Prefer original textures without optional mods.
+
+1. Test on firmware 13.60 if available. Record the firmware, loader, display mode, and title build.
+2. Start a new game. Compare character skin and the fire and candles in the first building after leaving the boat.
+3. Check the menus, an exterior scene, and a loaded save. Confirm that red and blue are not exchanged.
+4. Check neutral white and gray areas. Confirm that lighting and transparency have no new artifacts.
+5. Move the camera and change rooms. Check for alternating colors across buffer swaps.
+
+For a separate graphics check, package the existing probe with `python3 tools/pack-openmw.py --probe --out build/color-probe` after rebuilding the driver. The probe replaces the game executable in that package. Its triangle has red at the lower left, green at the lower right, and blue at the top. Compare the display with `/download0/graphics-probe.log`. Readback alone cannot verify VideoOut colors.
+
+Record the results before marking this correction as console-verified. Host checks do not verify the scanout format on PS5 hardware.
+
 ## Known limits
 
 - HD texture replacements produced flickering and remain disabled by default.
