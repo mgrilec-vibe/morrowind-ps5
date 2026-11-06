@@ -704,7 +704,8 @@ int ps5_agc_gate2_set_point_coord_input(uint32_t enabled)
 #define COMMAND_BYTES 0x4000u
 #define DIRECT_MEMORY_TYPE 12
 #define MAP_PROTECTION 0x33
-#define VIDEO_OUT_PIXEL_FORMAT UINT64_C(0x8000000000000000)
+/* SDR RGBA scanout: little-endian pixels are R, G, B, A bytes. */
+#define VIDEO_OUT_PIXEL_FORMAT UINT64_C(0x8000000022000000)
 #define RENDER_MARKER INT64_C(0x474c3301)
 #define AGC_INDEX_SIZE_16 0u
 #define AGC_INDEX_SIZE_32 1u
