@@ -54,6 +54,27 @@ For a separate graphics check, package the existing probe with `python3 tools/pa
 
 Record the results before marking this correction as console-verified. Host checks do not verify the scanout format on PS5 hardware.
 
+## Network benchmark build
+
+The benchmark implementation includes the merged scanout color correction. Capture and network control remain disabled until a valid benchmark config enables them.
+
+The native benchmark title compiles, links, and passes the packager's SELF integrity and presentation-asset checks. The host runtime passes socket scenarios for authentication, capture completion, buffer overflow, replay timing, input release, and normal quit. An AddressSanitizer and UndefinedBehaviorSanitizer smoke run completed both normal and overflow captures without sanitizer reports.
+
+A separate host smoke run used a real FTP server, the compiled C++ runtime, and the production runner. It completed prepare, attach, save-load control, capture, checksum validation, collection, and analysis. It preserved the normal settings and left the manually started runtime running. Its game callbacks were host fixtures, not a PS5 engine execution.
+
+The local PS5Upload engine reported version 8.5.1. The console pairing status was `none`. No pairing, title upload, launch, or shutdown was attempted on the console.
+
+PS5 validation remains required:
+
+1. Check that ordinary startup with no benchmark config opens the normal game.
+2. Follow [the benchmark guide](BENCHMARK.md) to prepare the profile and restart the title.
+3. Run one idle capture with `--attach`. Check the save, frame CSV, manifest, hashes, and collected logs.
+4. Run a movement scenario. Check the camera, actions, checkpoints, and input release after disconnect.
+5. Establish the PS5Upload trust relationship. Run automatic repeats and check normal exit between runs.
+6. Disable the benchmark config and restart. Check that normal saves, settings, and controls remain unchanged.
+
+Host results do not establish PS5 controller correctness, console lifecycle compatibility, GPU timing, or a performance improvement.
+
 ## Known limits
 
 - HD texture replacements produced flickering and remain disabled by default.

@@ -54,6 +54,8 @@ python3 tools/pack-openmw.py --out build/package
 
 Several build scripts expect the SDK’s default layout shown above. On a different layout, inspect their supported `PS5_OPENGL_ROOT`, `PS5_OPENGL_SDK`, `PS5_NATIVE_APP_TEMPLATE` and `PS5_SDL2_PREFIX` overrides. Do not assume that environment variables make every prerequisite relocatable.
 
+`tools/configure.sh` applies `patches/openmw-benchmark.patch` and installs the benchmark overlays. Repeated configuration is safe. The installer rejects local overlay edits that would be overwritten. The packaged benchmark examples are disabled by default. See [the benchmark guide](BENCHMARK.md) before enabling network control.
+
 The folder title is generated at `build/package/dist/PPSA99630`. Supply your own game data only for console testing; keep it outside source control and release packages. Detailed profiling and HD texture flags are off for the release.
 
 ## Host checks
@@ -63,6 +65,12 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 python3 tools/test-native-coalesce.py
 python3 tools/test-async-screen-ownership.py
 python3 tools/test-present-boundary-drain.py
+```
+
+The benchmark socket test compiles the real C++ runtime on the host. It requires a C++17 compiler, pthreads, and yaml-cpp development files:
+
+```sh
+python3 tests/runtime/test_ps5benchmark_runtime.py
 ```
 
 The native keyboard test uses the host SDL2 and libdecor development headers:

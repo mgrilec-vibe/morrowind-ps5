@@ -2,6 +2,7 @@
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 source "$root/tools/env.sh"
+python3 "$root/tools/apply-benchmark.py"
 args=()
 for target in LAUNCHER WIZARD OPENCS MWINIIMPORTER ESSIMPORTER BSATOOL ESMTOOL NIFTEST NAVMESHTOOL BULLETOBJECTTOOL; do
     args+=("-DBUILD_${target}=OFF")

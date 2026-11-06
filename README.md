@@ -20,6 +20,7 @@ A native PS5 port of [OpenMW 0.51.0](https://github.com/OpenMW/openmw), the open
 - Larger dialogs and text with a 150% interface scale.
 - Native submission batching and asynchronous batch preparation through the patched PS5 OpenGL driver.
 - Original game textures by default.
+- Experimental, opt-in [performance capture and network scenario control](docs/BENCHMARK.md). PS5 validation is pending.
 
 **v1.0.1 is the first stable release.** New Game uses the original opening and character-creation flow, with Sony's native keyboard for name entry. The interface is scaled to 150% for TV use. Tested on PS5 firmware 9.00 with kstuff and ShadowMount. See [validation and known limits](docs/VALIDATION.md).
 
