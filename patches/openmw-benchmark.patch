@@ -1,0 +1,404 @@
+diff --git a/apps/openmw/CMakeLists.txt b/apps/openmw/CMakeLists.txt
+--- a/apps/openmw/CMakeLists.txt
++++ b/apps/openmw/CMakeLists.txt
+@@ -2,6 +2,10 @@
+     engine.cpp
+     options.cpp
+ )
++
++if(PS5)
++    list(APPEND OPENMW_SOURCES ps5benchmark.cpp)
++endif()
+ 
+ set(OPENMW_RESOURCES
+     ${CMAKE_SOURCE_DIR}/files/windows/openmw.rc
+@@ -14,6 +18,10 @@
+     options.hpp
+     profile.hpp
+ )
++
++if(PS5)
++    list(APPEND OPENMW_HEADERS ps5benchmark.hpp)
++endif()
+ 
+ source_group(apps/openmw FILES main.cpp androidmain.cpp ${OPENMW_SOURCES} ${OPENMW_HEADERS} ${OPENMW_RESOURCES})
+ 
+diff --git a/apps/openmw/engine.cpp b/apps/openmw/engine.cpp
+--- a/apps/openmw/engine.cpp
++++ b/apps/openmw/engine.cpp
+@@ -4,6 +4,7 @@
+ #include <chrono>
+ #include <future>
+ #include <system_error>
++#include <stdexcept>
+ 
+ #include <osgDB/ReaderWriter>
+ #include <osgDB/Registry>
+@@ -55,6 +56,11 @@
+ #include <components/settings/values.hpp>
+ 
+ #include "mwinput/inputmanagerimp.hpp"
++
++#ifdef __PROSPERO__
++#include "mwinput/actions.hpp"
++#include "ps5benchmark.hpp"
++#endif
+ 
+ #include "mwgui/windowmanagerimp.hpp"
+ 
+@@ -193,7 +199,10 @@
+     const osg::Timer* const timer = osg::Timer::instance();
+     osg::Stats* const stats = mViewer->getViewerStats();
+ #ifdef __PROSPERO__
+-    const osg::Timer_t ps5FrameStart = timer->tick();
++    const bool benchmarkCapture = MWPS5Benchmark::captureEnabled();
++    using BenchmarkClock = std::chrono::steady_clock;
++    const BenchmarkClock::time_point benchmarkUpdateStart
++        = benchmarkCapture ? BenchmarkClock::now() : BenchmarkClock::time_point{};
+ #endif
+ 
+     mEnvironment.setFrameDuration(frametime);
+@@ -355,22 +364,27 @@
+     mLuaWorker->allowUpdate(frameStart, frameNumber, *stats);
+ 
+ #ifdef __PROSPERO__
+-    const osg::Timer_t ps5RenderStart = timer->tick();
++    const BenchmarkClock::time_point benchmarkRenderStart
++        = benchmarkCapture ? BenchmarkClock::now() : BenchmarkClock::time_point{};
+ #endif
+     mViewer->renderingTraversals();
+ 
+ #ifdef __PROSPERO__
+-    const osg::Timer_t ps5RenderEnd = timer->tick();
++    const BenchmarkClock::time_point benchmarkRenderEnd
++        = benchmarkCapture ? BenchmarkClock::now() : BenchmarkClock::time_point{};
+ #endif
+     mLuaWorker->finishUpdate(frameStart, frameNumber, *stats);
+ #ifdef __PROSPERO__
+-    static unsigned ps5ProfileFrames = 0;
+-    ++ps5ProfileFrames;
+-    if (ps5ProfileFrames <= 3 || ps5ProfileFrames % 60 == 0)
+-        Log(Debug::Info) << "PS5 frame timing " << ps5ProfileFrames
+-                        << " update_ms=" << timer->delta_m(ps5FrameStart, ps5RenderStart)
+-                        << " render_ms=" << timer->delta_m(ps5RenderStart, ps5RenderEnd)
+-                        << " lua_wait_ms=" << timer->delta_m(ps5RenderEnd, timer->tick());
++    if (benchmarkCapture)
++    {
++        const BenchmarkClock::time_point benchmarkLuaEnd = BenchmarkClock::now();
++        mBenchmarkUpdateNs = static_cast<std::uint64_t>(
++            std::chrono::duration_cast<std::chrono::nanoseconds>(benchmarkRenderStart - benchmarkUpdateStart).count());
++        mBenchmarkRenderNs = static_cast<std::uint64_t>(
++            std::chrono::duration_cast<std::chrono::nanoseconds>(benchmarkRenderEnd - benchmarkRenderStart).count());
++        mBenchmarkLuaWaitNs = static_cast<std::uint64_t>(
++            std::chrono::duration_cast<std::chrono::nanoseconds>(benchmarkLuaEnd - benchmarkRenderEnd).count());
++    }
+ #endif
+ 
+     return true;
+@@ -864,6 +878,26 @@
+     mEnvironment.setWorldModel(mWorld->getWorldModel());
+     mEnvironment.setESMStore(mWorld->getStore());
+ 
++#ifdef __PROSPERO__
++    MWPS5Benchmark::bindCallbacks({
++        [this](std::string_view saveName) {
++            const std::filesystem::path filename{ std::string(saveName) };
++            if (filename.empty() || filename.is_absolute() || filename.has_parent_path() || filename == "."
++                || filename == "..")
++                throw std::invalid_argument("benchmark save must be a filename");
++
++            const auto savePath = (mCfgMgr.getUserDataPath() / ".." / "saves" / filename).lexically_normal();
++            std::error_code error;
++            if (!std::filesystem::is_regular_file(savePath, error) || error)
++                throw std::runtime_error("benchmark save file is unavailable");
++            mStateManager->loadGame(savePath);
++            if (mStateManager->getState() != MWBase::StateManager::State_Running)
++                throw std::runtime_error("benchmark save failed to load");
++        },
++        [this] { mStateManager->requestQuit(); },
++    });
++#endif
++
+     const MWWorld::Store<ESM::GameSetting>* gmst = &mWorld->getStore().get<ESM::GameSetting>();
+     mL10nManager->setGmstLoader([gmst, misses = std::set<std::string, Misc::StringUtils::CiComp>()](
+                                     std::string_view gmstName) mutable -> const std::string* {
+@@ -1056,10 +1090,49 @@
+     Misc::FrameRateLimiter frameRateLimiter = Misc::makeFrameRateLimiter(mEnvironment.getFrameRateLimit());
+     const std::chrono::steady_clock::duration maxSimulationInterval(std::chrono::milliseconds(200));
+ #ifdef __PROSPERO__
+-    unsigned ps5RenderedFrames = 0;
++    bool benchmarkActivateWasActive = false;
+ #endif
+     while (!mViewer->done() && !mStateManager->hasQuitRequest())
+     {
++#ifdef __PROSPERO__
++        if (MWPS5Benchmark::captureEnabled())
++            MWPS5Benchmark::frameStart();
++        if (MWPS5Benchmark::enabled())
++        {
++            MWPS5Benchmark::GameStateSnapshot snapshot;
++            snapshot.ready = mStateManager->getState() == MWBase::StateManager::State_Running;
++            // StateManager has no loading state; load callbacks complete before the next snapshot.
++            snapshot.loading = false;
++            snapshot.paused = timeManager.isPaused();
++            snapshot.simulationSeconds = timeManager.getSimulationTime();
++            if (snapshot.ready)
++            {
++                const MWWorld::Ptr player = mWorld->getPlayerPtr();
++                if (!player.isEmpty())
++                {
++                    const auto& position = player.getRefData().getPosition();
++                    snapshot.cellName = mWorld->getCellName();
++                    snapshot.playerX = position.pos[0];
++                    snapshot.playerY = position.pos[1];
++                    snapshot.playerZ = position.pos[2];
++                    snapshot.playerRotX = position.rot[0];
++                    snapshot.playerRotY = position.rot[1];
++                    snapshot.playerRotZ = position.rot[2];
++                }
++            }
++            MWPS5Benchmark::gameThreadPump(snapshot);
++        }
++#endif
++#ifdef __PROSPERO__
++        const bool benchmarkActivateActive
++            = MWPS5Benchmark::inputActive() && MWPS5Benchmark::actionIsActive(MWPS5Benchmark::Action::Activate);
++        if (benchmarkActivateActive && !benchmarkActivateWasActive)
++            MWBase::Environment::get().getInputManager()->executeAction(MWInput::A_Activate);
++        benchmarkActivateWasActive = benchmarkActivateActive;
++#endif
++#ifdef __PROSPERO__
++        const bool benchmarkCapture = MWPS5Benchmark::captureEnabled();
++#endif
+         const double dt = std::chrono::duration_cast<std::chrono::duration<double>>(
+                               std::min(frameRateLimiter.getLastFrameDuration(), maxSimulationInterval))
+                               .count()
+@@ -1071,14 +1144,13 @@
+ 
+         if (!frame(frameNumber, static_cast<float>(dt)))
+         {
++#ifdef __PROSPERO__
++            if (benchmarkCapture)
++                MWPS5Benchmark::frameSkipped();
++#endif
+             std::this_thread::sleep_for(std::chrono::milliseconds(5));
+             continue;
+         }
+-#ifdef __PROSPERO__
+-        ++ps5RenderedFrames;
+-        if (ps5RenderedFrames == 1 || ps5RenderedFrames == 60)
+-            Log(Debug::Info) << "PS5 completed main-loop frame " << ps5RenderedFrames;
+-#endif
+         timeManager.updateIsPaused();
+         if (!timeManager.isPaused())
+         {
+@@ -1101,7 +1173,21 @@
+             }
+         }
+ 
++#ifdef __PROSPERO__
++        const auto benchmarkLimiterStart
++            = benchmarkCapture ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
++#endif
+         frameRateLimiter.limit();
++#ifdef __PROSPERO__
++        if (benchmarkCapture)
++        {
++            const auto benchmarkLimiterEnd = std::chrono::steady_clock::now();
++            const auto limiterNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                benchmarkLimiterEnd - benchmarkLimiterStart).count();
++            MWPS5Benchmark::frameEnd(mBenchmarkUpdateNs, mBenchmarkRenderNs, mBenchmarkLuaWaitNs,
++                static_cast<std::uint64_t>(limiterNs));
++        }
++#endif
+     }
+ 
+     mLuaWorker->join();
+diff --git a/apps/openmw/engine.hpp b/apps/openmw/engine.hpp
+--- a/apps/openmw/engine.hpp
++++ b/apps/openmw/engine.hpp
+@@ -2,6 +2,9 @@
+ #define ENGINE_H
+ 
+ #include <filesystem>
++#ifdef __PROSPERO__
++#include <cstdint>
++#endif
+ 
+ #include <components/compiler/extensions.hpp>
+ #include <components/debug/debuglog.hpp>
+@@ -186,6 +189,11 @@
+         Files::ConfigurationManager& mCfgMgr;
+         int mGlMaxTextureImageUnits;
+ 
++#ifdef __PROSPERO__
++        std::uint64_t mBenchmarkUpdateNs = 0;
++        std::uint64_t mBenchmarkRenderNs = 0;
++        std::uint64_t mBenchmarkLuaWaitNs = 0;
++#endif
+         // not implemented
+         Engine(const Engine&);
+         Engine& operator=(const Engine&);
+diff --git a/apps/openmw/main.cpp b/apps/openmw/main.cpp
+--- a/apps/openmw/main.cpp
++++ b/apps/openmw/main.cpp
+@@ -28,6 +28,9 @@
+ #include <cstdio>
+ #include <sys/stat.h>
+ #include <unistd.h>
++#endif
++#ifdef __PROSPERO__
++#include "ps5benchmark.hpp"
+ #endif
+ 
+ #if (defined(__APPLE__) || defined(__linux) || defined(__unix) || defined(__posix))
+@@ -222,6 +225,13 @@
+ int runApplication(int argc, char* argv[])
+ {
+     Platform::init();
++#ifdef __PROSPERO__
++    struct BenchmarkShutdownGuard
++    {
++        ~BenchmarkShutdownGuard() { MWPS5Benchmark::shutdown(); }
++    } benchmarkShutdownGuard;
++    MWPS5Benchmark::initialize("/download0/config/benchmark.json", {});
++#endif
+ 
+ #ifdef __APPLE__
+     setenv("OSG_GL_TEXTURE_STORAGE", "OFF", 0);
+diff --git a/apps/openmw/mwinput/bindingsmanager.cpp b/apps/openmw/mwinput/bindingsmanager.cpp
+--- a/apps/openmw/mwinput/bindingsmanager.cpp
++++ b/apps/openmw/mwinput/bindingsmanager.cpp
+@@ -1,5 +1,6 @@
+ #include "bindingsmanager.hpp"
+ 
++#include <cmath>
+ #include <filesystem>
+ 
+ #include <MyGUI_EditBox.h>
+@@ -16,6 +17,10 @@
+ #include "../mwbase/windowmanager.hpp"
+ 
+ #include "actions.hpp"
++
++#ifdef __PROSPERO__
++#include "../ps5benchmark.hpp"
++#endif
+ 
+ namespace MWInput
+ {
+@@ -237,11 +242,72 @@
+ 
+     float BindingsManager::getActionValue(int id) const
+     {
++#ifdef __PROSPERO__
++        if (MWPS5Benchmark::inputActive())
++        {
++            const MWPS5Benchmark::InputState input = MWPS5Benchmark::inputState();
++            switch (id)
++            {
++                case A_MoveForward:
++                    return MWPS5Benchmark::actionIsActive(MWPS5Benchmark::Action::Forward) ? 1.f : 0.f;
++                case A_MoveBackward:
++                    return MWPS5Benchmark::actionIsActive(MWPS5Benchmark::Action::Backward) ? 1.f : 0.f;
++                case A_MoveLeft:
++                    return MWPS5Benchmark::actionIsActive(MWPS5Benchmark::Action::Left) ? 1.f : 0.f;
++                case A_MoveRight:
++                    return MWPS5Benchmark::actionIsActive(MWPS5Benchmark::Action::Right) ? 1.f : 0.f;
++                case A_MoveForwardBackward:
++                    return 0.5f - input.forward * 0.5f;
++                case A_MoveLeftRight:
++                    return 0.5f + input.strafe * 0.5f;
++                case A_LookUpDown:
++                    return MWPS5Benchmark::actionValue(MWPS5Benchmark::Action::LookY);
++                case A_LookLeftRight:
++                    return MWPS5Benchmark::actionValue(MWPS5Benchmark::Action::LookX);
++                case A_Jump:
++                    return MWPS5Benchmark::actionValue(MWPS5Benchmark::Action::Jump);
++                case A_Activate:
++                    return MWPS5Benchmark::actionValue(MWPS5Benchmark::Action::Activate);
++                case A_Use:
++                    return MWPS5Benchmark::actionValue(MWPS5Benchmark::Action::Attack);
++                case A_Run:
++                    return MWPS5Benchmark::actionValue(MWPS5Benchmark::Action::Run);
++                case A_Sneak:
++                    return MWPS5Benchmark::actionValue(MWPS5Benchmark::Action::Sneak);
++            }
++        }
++#endif
+         return mInputBinder->getChannel(id)->getValue();
+     }
+ 
+     bool BindingsManager::actionIsActive(int id) const
+     {
++#ifdef __PROSPERO__
++        if (MWPS5Benchmark::inputActive())
++        {
++            switch (id)
++            {
++                case A_MoveForward:
++                    return MWPS5Benchmark::actionIsActive(MWPS5Benchmark::Action::Forward);
++                case A_MoveBackward:
++                    return MWPS5Benchmark::actionIsActive(MWPS5Benchmark::Action::Backward);
++                case A_MoveLeft:
++                    return MWPS5Benchmark::actionIsActive(MWPS5Benchmark::Action::Left);
++                case A_MoveRight:
++                    return MWPS5Benchmark::actionIsActive(MWPS5Benchmark::Action::Right);
++                case A_Jump:
++                    return MWPS5Benchmark::actionIsActive(MWPS5Benchmark::Action::Jump);
++                case A_Activate:
++                    return MWPS5Benchmark::actionIsActive(MWPS5Benchmark::Action::Activate);
++                case A_Use:
++                    return MWPS5Benchmark::actionIsActive(MWPS5Benchmark::Action::Attack);
++                case A_Run:
++                    return MWPS5Benchmark::actionIsActive(MWPS5Benchmark::Action::Run);
++                case A_Sneak:
++                    return MWPS5Benchmark::actionIsActive(MWPS5Benchmark::Action::Sneak);
++            }
++        }
++#endif
+         return getActionValue(id) == 1.0;
+     }
+ 
+@@ -684,6 +750,15 @@
+ 
+     void BindingsManager::actionValueChanged(int action, float currentValue, float previousValue)
+     {
++#ifdef __PROSPERO__
++        const bool benchmarkAxis = action == A_MoveForwardBackward || action == A_MoveLeftRight
++            || action == A_LookUpDown || action == A_LookLeftRight;
++        const bool physicalAction = (previousValue <= 0.6f && currentValue > 0.6f)
++            || (benchmarkAxis && std::abs(currentValue - 0.5f) > 0.12f
++                && std::abs(currentValue - previousValue) >= 0.12f);
++        if (MWPS5Benchmark::inputActive() && physicalAction)
++            MWPS5Benchmark::physicalInputObserved();
++#endif
+         auto manager = MWBase::Environment::get().getInputManager();
+         manager->resetIdleTime();
+ 
+diff --git a/apps/openmw/mwinput/mousemanager.cpp b/apps/openmw/mwinput/mousemanager.cpp
+--- a/apps/openmw/mwinput/mousemanager.cpp
++++ b/apps/openmw/mwinput/mousemanager.cpp
+@@ -20,6 +20,10 @@
+ 
+ #include "actions.hpp"
+ #include "bindingsmanager.hpp"
++
++#ifdef __PROSPERO__
++#include "../ps5benchmark.hpp"
++#endif
+ 
+ namespace MWInput
+ {
+@@ -50,6 +54,11 @@
+         mBindingsManager->mouseMoved(arg);
+ 
+         MWBase::InputManager* input = MWBase::Environment::get().getInputManager();
++#ifdef __PROSPERO__
++        if (MWPS5Benchmark::inputActive() && mMouseLookEnabled && !input->controlsDisabled()
++            && (std::abs(arg.xrel) > 1 || std::abs(arg.yrel) > 1))
++            MWPS5Benchmark::physicalInputObserved();
++#endif
+         input->setJoystickLastUsed(false);
+         input->resetIdleTime();
+ 

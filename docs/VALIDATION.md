@@ -54,6 +54,33 @@ For a separate graphics check, package the existing probe with `python3 tools/pa
 
 Record the results before marking this correction as console-verified. Host checks do not verify the scanout format on PS5 hardware.
 
+## Network benchmark build
+
+The benchmark implementation includes the merged scanout color correction. Capture and network control remain disabled until a valid benchmark config enables them.
+
+The native benchmark title compiles, links, and passes the packager's SELF integrity and presentation-asset checks. The host runtime passes socket scenarios for authentication, capture completion, buffer overflow, replay timing, input release, and normal quit. An AddressSanitizer and UndefinedBehaviorSanitizer smoke run completed both normal and overflow captures without sanitizer reports.
+
+A separate host smoke run used a real FTP server, the compiled C++ runtime, and the production runner. It completed prepare, attach, save-load control, capture, checksum validation, collection, and analysis. It preserved the normal settings and left the manually started runtime running. Its game callbacks were host fixtures, not a PS5 engine execution.
+
+Console lifecycle validation used the installed title and the standalone ELF helper. The production `console-game.py` commands bootstrapped the helper through TCP 9021, launched `PPSA99630` to the main menu, requested normal game quit, confirmed process absence, and launched it again. Authenticated game status confirmed the final main-menu state. No PS5Upload, pairing, forced kill, or ShellUI injection was used.
+
+The helper's process query uses the title ID at app-info offset 16, verified by a read-only probe on this console. A live non-app process returned success with an empty title. A missing PID returned `0x80020003`. Other query failures remain errors rather than evidence that the game is stopped.
+
+The original benchmark save check failed on this console because `canonical()` returned `EPERM` for the sandbox saves directory. Direct entry-status checks now reject symlinks without requiring canonicalization. The socket regression reproduces denied `realpath` and passes with the correction. Console save loading was deferred at the operator's request.
+
+The corrected native title passed SELF integrity checks and full raw FTP readback. Its executable SHA-256 is `aea3d7b0a0bec8bf47ba34b34caa28cf32770bbed8123f0c3642af1abd63586a`. FTP SELF decoding must be disabled on the verification connection to compare stored executable bytes.
+
+All 44 host tests and the C++ socket regression passed after the direct lifecycle migration.
+
+Remaining PS5 validation:
+
+1. Run one idle capture with a benchmark save. Check the frame CSV, manifest, hashes, and collected logs.
+2. Run a movement scenario. Check the camera, actions, checkpoints, and input release after disconnect.
+3. Run automatic benchmark repeats through the direct helper.
+4. Disable the benchmark config and restart. Check that normal saves, settings, and controls remain unchanged.
+
+Host results do not establish PS5 controller correctness, console lifecycle compatibility, GPU timing, or a performance improvement.
+
 ## Known limits
 
 - HD texture replacements produced flickering and remain disabled by default.

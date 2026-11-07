@@ -48,5 +48,37 @@ class PacingTests(unittest.TestCase):
   self.assertEqual(len(result['rejection_signatures']),1)
   self.assertEqual(result['driver_window_count'],0)
   self.assertEqual(result['engine_sample_count'],0)
+ def test_full_frame_intervals_percentiles_and_strict_stall_thresholds(self):
+  intervals=[10_000_000,16_670_000,33_330_000,50_000_000,50_010_000]
+  header=','.join(pacing.FRAME_FIELDS)
+  rows=[header]
+  for frame,interval in enumerate(intervals,1):
+   rows.append(','.join(map(str,[frame,'capture',frame*1_000_000,interval,
+    frame*1_000_000,2_000_000,100_000,interval-3_100_000,-1,0,0,1,
+    10.0,20.0,30.0,0.0,0.5,1.0])))
+  manifest={'status':'complete','frames_file':'frames.csv','frame_count':5}
+  capture='\n'.join(rows)+'\n'
+  report=pacing.analyze_capture(capture,manifest)
+  with self.assertRaisesRegex(ValueError,'checksum'):
+   pacing.analyze_capture(capture,{**manifest,'frames_sha256':'bad'})
+  self.assertEqual(report['record_kind'],'full_frame_capture')
+  self.assertEqual(report['frame_interval_ms']['median_ms'],33.33)
+  self.assertAlmostEqual(report['frame_interval_ms']['p95_ms'],50.008)
+  self.assertEqual(report['stall_counts'],{
+   'over_16_67_ms':3,'over_33_33_ms':2,'over_50_ms':1})
+  self.assertAlmostEqual(report['mean_fps'],5_000_000_000/160_010_000)
+  self.assertFalse(report['state_counts']['actor_rotations_are_camera_orientation'])
+ def test_full_frame_capture_rejects_incomplete_and_missing_records(self):
+  header=','.join(pacing.FRAME_FIELDS)
+  row=','.join(map(str,[1,'capture',0,20_000_000,2_000_000,3_000_000,
+   100_000,14_900_000,-1,0,0,1,0,0,0,0,0,0]))
+  with self.assertRaises(ValueError):
+   pacing.analyze_capture(header+'\n'+row+'\n',{'status':'incomplete','frames_file':'frames.csv'})
+  with self.assertRaises(ValueError):
+   pacing.analyze_capture(header+'\n'+row+'\n'+row+'\n',
+    {'status':'complete','frames_file':'frames.csv','frame_count':2})
+ def test_legacy_records_are_explicitly_sampled(self):
+  result=pacing.analyze('PS5 frame timing 3c update_ms=2 render_ms=30 lua_wait_ms=0.1')
+  self.assertEqual(result['record_kind'],'legacy_sparse_log_samples')
 
 if __name__=='__main__':unittest.main()

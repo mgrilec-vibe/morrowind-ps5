@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "save": "idle-test.omwsave",
+  "warmup_seconds": 30,
+  "duration_seconds": 60,
+  "events": [
+    {
+      "time": 0,
+      "input": {
+        "forward": 0,
+        "strafe": 0,
+        "look_x": 0,
+        "look_y": 0,
+        "jump": false,
+        "activate": false,
+        "attack": false,
+        "run": false,
+        "sneak": false
+      }
+    }
+  ],
+  "checkpoints": []
+}

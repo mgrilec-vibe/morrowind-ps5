@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from texture_pack import config_data_line, load_manifest
 
@@ -66,6 +67,77 @@ def openmw_link_inputs():
         if token.endswith((".a", ".o")):
             libraries.append(path)
     return objects, libraries
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_identity(path):
+    # An extracted engine tree must not inherit the enclosing port's revision.
+    if not (Path(path) / ".git").exists():
+        return {"revision": None, "worktree": "unknown"}
+    revision = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=False)
+    if revision.returncode:
+        return {"revision": None, "worktree": "unknown"}
+    status = subprocess.run(
+        ["git", "-C", str(path), "status", "--porcelain", "--untracked-files=no"],
+        capture_output=True, text=True, check=False)
+    return {"revision": revision.stdout.strip(),
+            "worktree": ("unknown" if status.returncode else
+                         ("modified" if status.stdout.strip() else "clean"))}
+
+
+def benchmark_build_metadata(args, driver_receipt):
+    flags = ("PS5_PORT_PROFILE", "PS5_NATIVE_SUBMIT_COALESCE", "PS5_ASYNC_BATCH",
+             "PS5_PRESENT_COMPLETION_WAIT", "PS5_CLFLUSHOPT", "PS5_LIGHT_DIAGNOSTICS",
+             "PS5_OSG_DETAILED_PROFILE")
+    metadata = {
+        "schema_version": 1,
+        "title_id": TITLE_ID,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "project": git_identity(REPO),
+        "openmw": git_identity(SOURCE),
+        "settings_cfg_sha256": file_sha256(REPO / "config/settings.cfg"),
+        "openmw_default_config_sha256": file_sha256(SOURCE / "files/openmw.cfg"),
+        "sources_lock_sha256": file_sha256(REPO / "sources.lock.json"),
+        "driver_build": driver_receipt,
+        "package_options": {
+            "demo": args.demo, "probe": args.probe, "hold_on_assert": args.hold_on_assert,
+            "hd_textures": args.hd_textures, "hd_texture_profile": args.hd_texture_profile,
+            "heap_mib": args.heap_mib,
+        },
+        "packaging_environment": {key: os.environ.get(key) for key in flags},
+    }
+    return metadata
+
+
+def set_build_id(metadata):
+    identity = {key: value for key, value in metadata.items() if key != "build_id"}
+    payload = json.dumps(identity, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    metadata["build_id"] = hashlib.sha256(payload).hexdigest()
+
+
+def write_benchmark_examples(assets, args, driver_receipt):
+    benchmark = assets / "benchmark"
+    examples = benchmark / "examples"
+    examples.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(REPO / "config/benchmark-example-disabled.json",
+                 examples / "benchmark-disabled.json")
+    shutil.copy2(REPO / "config/benchmark-example-idle.json",
+                 examples / "scenario-idle.json")
+    metadata = benchmark_build_metadata(args, driver_receipt)
+    set_build_id(metadata)
+    (benchmark / "buildmeta.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+    return metadata
+
+
 
 
 def main():
@@ -173,7 +245,7 @@ def main():
     # The template's home-screen preview sound is a test tone, not game audio.
     (out / "sce_sys/snd0.at9").unlink(missing_ok=True)
 
-    # Game content is transferred separately to M.2. Package engine resources only.
+    # User game data is supplied separately. Package engine resources only.
     resources = BUILD / "resources"
     if not args.probe and not resources.is_dir():
         raise SystemExit("generated OpenMW resources are missing")
@@ -214,6 +286,9 @@ def main():
     shutil.copy2(REPO / "config/alsoft.conf", out / "assets/alsoft.conf")
     shutil.copy2(SOURCE / "files/gamecontrollerdb.txt", out / "assets/gamecontrollerdb.txt")
     shutil.copy2(REPO / "config/settings.cfg", out / "assets/settings.cfg")
+    buildmeta = None
+    if not args.probe:
+        buildmeta = write_benchmark_examples(out / "assets", args, driver_receipt)
 
     replace_once(out / "tooling/native/sce_module_writer.cpp",
                  "write_u64(result.data, result.heap_size, std::numeric_limits<std::uint64_t>::max());",
@@ -283,6 +358,13 @@ def main():
     if "PosixForWebKit" in needed:
         raise SystemExit("eboot still imports libScePosixForWebKit")
     app = out / "dist" / param["titleId"]
+    if buildmeta is not None:
+        buildmeta["eboot_sha256"] = file_sha256(app / "eboot.bin")
+        set_build_id(buildmeta)
+        benchmark_assets = out / "assets/benchmark"
+        (benchmark_assets / "buildmeta.json").write_text(
+            json.dumps(buildmeta, indent=2, sort_keys=True) + "\n")
+        shutil.copytree(benchmark_assets, app / "assets/benchmark", dirs_exist_ok=True)
     print(f"OpenMW title folder: {app}")
 
 
