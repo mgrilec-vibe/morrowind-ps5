@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ftplib
 import json
+import math
 import posixpath
 import socket
 import time
@@ -29,9 +30,10 @@ class BenchmarkClient:
     def __init__(self, host, port=9137, token=None, timeout=5.0):
         if not token or len(token) < 32 or any(c not in '0123456789abcdefABCDEF' for c in token):
             raise ValueError('benchmark token must contain at least 32 hexadecimal characters')
-        if not 1 <= int(port) <= 65535 or timeout <= 0:
+        if (not 1 <= int(port) <= 65535 or not math.isfinite(timeout) or timeout <= 0):
             raise ValueError('invalid control port or timeout')
-        self.host, self.port, self.token, self.timeout = host, int(port), token, float(timeout)
+        self.host, self.port, self.token = host, int(port), token
+        self.timeout = self._configured_timeout = float(timeout)
         self._socket = None
         self._reader = None
         self._writer = None
@@ -59,10 +61,23 @@ class BenchmarkClient:
                 pass
         self._socket = self._reader = self._writer = None
 
+    def set_timeout(self, timeout):
+        """Set the active socket timeout, for deadline-bounded operations."""
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError('control timeout must be positive and finite')
+        self.timeout = float(timeout)
+        if self._socket is not None:
+            self._socket.settimeout(self.timeout)
+
     def connect_until(self, *, deadline, poll_interval=0.5):
         """Retry a not-yet-started listener until a bounded monotonic deadline."""
         last_error = None
-        while time.monotonic() < deadline:
+        attempt_timeout = self._configured_timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self.set_timeout(min(attempt_timeout, remaining))
             try:
                 self.connect()
                 return
@@ -144,13 +159,21 @@ class BenchmarkClient:
 
     def wait_for(self, predicate, *, deadline, poll_interval=0.5, description='runtime state'):
         """Poll authoritative status with a fixed monotonic deadline."""
-        while True:
-            status = self.status()
-            if predicate(status):
-                return status
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f'timed out waiting for {description}')
-            time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f'timed out waiting for {description}')
+                self.set_timeout(min(self._configured_timeout, remaining))
+                status = self.status()
+                if predicate(status):
+                    return status
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f'timed out waiting for {description}')
+                time.sleep(min(poll_interval, remaining))
+        finally:
+            self.set_timeout(self._configured_timeout)
 
 
 class FTPStorage:

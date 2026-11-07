@@ -62,16 +62,22 @@ The native benchmark title compiles, links, and passes the packager's SELF integ
 
 A separate host smoke run used a real FTP server, the compiled C++ runtime, and the production runner. It completed prepare, attach, save-load control, capture, checksum validation, collection, and analysis. It preserved the normal settings and left the manually started runtime running. Its game callbacks were host fixtures, not a PS5 engine execution.
 
-The local PS5Upload engine reported version 8.5.1. The console pairing status was `none`. No pairing, title upload, launch, or shutdown was attempted on the console.
+Console lifecycle validation used the installed title and the standalone ELF helper. The production `console-game.py` commands bootstrapped the helper through TCP 9021, launched `PPSA99630` to the main menu, requested normal game quit, confirmed process absence, and launched it again. Authenticated game status confirmed the final main-menu state. No PS5Upload, pairing, forced kill, or ShellUI injection was used.
 
-PS5 validation remains required:
+The helper's process query uses the title ID at app-info offset 16, verified by a read-only probe on this console. A live non-app process returned success with an empty title. A missing PID returned `0x80020003`. Other query failures remain errors rather than evidence that the game is stopped.
 
-1. Check that ordinary startup with no benchmark config opens the normal game.
-2. Follow [the benchmark guide](BENCHMARK.md) to prepare the profile and restart the title.
-3. Run one idle capture with `--attach`. Check the save, frame CSV, manifest, hashes, and collected logs.
-4. Run a movement scenario. Check the camera, actions, checkpoints, and input release after disconnect.
-5. Establish the PS5Upload trust relationship. Run automatic repeats and check normal exit between runs.
-6. Disable the benchmark config and restart. Check that normal saves, settings, and controls remain unchanged.
+The original benchmark save check failed on this console because `canonical()` returned `EPERM` for the sandbox saves directory. Direct entry-status checks now reject symlinks without requiring canonicalization. The socket regression reproduces denied `realpath` and passes with the correction. Console save loading was deferred at the operator's request.
+
+The corrected native title passed SELF integrity checks and full raw FTP readback. Its executable SHA-256 is `aea3d7b0a0bec8bf47ba34b34caa28cf32770bbed8123f0c3642af1abd63586a`. FTP SELF decoding must be disabled on the verification connection to compare stored executable bytes.
+
+All 44 host tests and the C++ socket regression passed after the direct lifecycle migration.
+
+Remaining PS5 validation:
+
+1. Run one idle capture with a benchmark save. Check the frame CSV, manifest, hashes, and collected logs.
+2. Run a movement scenario. Check the camera, actions, checkpoints, and input release after disconnect.
+3. Run automatic benchmark repeats through the direct helper.
+4. Disable the benchmark config and restart. Check that normal saves, settings, and controls remain unchanged.
 
 Host results do not establish PS5 controller correctness, console lifecycle compatibility, GPU timing, or a performance improvement.
 

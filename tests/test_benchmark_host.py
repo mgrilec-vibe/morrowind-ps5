@@ -3,11 +3,13 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import socket
 import socketserver
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -26,6 +28,7 @@ def load_script(name, module_name):
 
 
 runner = load_script('run-benchmark.py', 'run_benchmark')
+console_game = load_script('console-game.py', 'console_game')
 pacing = load_script('analyze-frame-pacing.py', 'pacing_for_host_test')
 packager = load_script('pack-openmw.py', 'pack_for_host_test')
 
@@ -43,12 +46,11 @@ class BuildProvenanceTests(unittest.TestCase):
             engine.mkdir()
             self.assertEqual(packager.git_identity(engine),
                              {'revision': None, 'worktree': 'unknown'})
-
-
 class ReplyHandler(socketserver.StreamRequestHandler):
     response_id_delta = 0
     reject = False
     oversize = False
+    delay_s = 0
     requests = []
 
     def handle(self):
@@ -68,7 +70,52 @@ class ReplyHandler(socketserver.StreamRequestHandler):
                 'manifest': None, 'frames': None, 'error': None, 'loaded_save': None,
                 'last_command_id': 0, 'last_command_error': '',
             }
+        if type(self).delay_s:
+            time.sleep(type(self).delay_s)
+            return
         self.wfile.write((json.dumps(reply) + '\n').encode())
+
+
+class ControlSocketFixture:
+    def __init__(self, states, events, *, port=0):
+        self.states = list(states)
+        self.events = events
+        self.requests = []
+        owner = self
+
+        class Handler(socketserver.StreamRequestHandler):
+            def handle(self):
+                owner.events.append(('control_connected',))
+                while line := self.rfile.readline():
+                    request = json.loads(line)
+                    owner.requests.append(request)
+                    reply = {'version': 1, 'id': request['id'],
+                             'accepted': True, 'complete': True}
+                    if request['command'] == 'status':
+                        state = owner.states.pop(0) if len(owner.states) > 1 else owner.states[0]
+                        owner.events.append(('game_state', state['game_state']))
+                        reply['status'] = {
+                            'ready': state['ready'], 'game_state': state['game_state'],
+                            'run_id': None, 'capture_state': 'idle', 'completed': False,
+                            'manifest': None, 'frames': None, 'error': None,
+                            'loaded_save': None, 'last_command_id': 0,
+                            'last_command_error': None,
+                        }
+                    else:
+                        owner.events.append(('command', request['command']))
+                    self.wfile.write(json.dumps(reply).encode() + bytes((10,)))
+                    self.wfile.flush()
+
+        self.server = socketserver.ThreadingTCPServer(('127.0.0.1', port), Handler)
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.port = self.server.server_address[1]
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
 
 
 class ClientProtocolTests(unittest.TestCase):
@@ -76,7 +123,7 @@ class ClientProtocolTests(unittest.TestCase):
         ReplyHandler.response_id_delta = 0
         ReplyHandler.reject = False
         ReplyHandler.oversize = False
-        ReplyHandler.requests = []
+        ReplyHandler.delay_s = 0
         self.server = socketserver.ThreadingTCPServer(('127.0.0.1', 0), ReplyHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -103,6 +150,23 @@ class ClientProtocolTests(unittest.TestCase):
         ReplyHandler.reject = True
         with self.client() as client, self.assertRaisesRegex(BenchmarkError, 'rejected by fixture'):
             client.command('load_save', save='fixture.omwsave')
+
+    def test_wait_for_restores_configured_timeout_after_success(self):
+        with self.client() as client:
+            status = client.wait_for(
+                lambda value: value['game_state'] == 'ready',
+                deadline=time.monotonic() + 1, poll_interval=0.001,
+            )
+            self.assertEqual(status['game_state'], 'ready')
+            self.assertEqual(client.timeout, 5.0)
+    def test_wait_for_bounds_status_read_by_remaining_deadline(self):
+        ReplyHandler.delay_s = 0.1
+        with self.client() as client:
+            with self.assertRaises(BenchmarkError):
+                client.wait_for(
+                    lambda status: False, deadline=time.monotonic() + 0.02,
+                    poll_interval=0.001, description='delayed status',
+                )
 
 
 class ScenarioContractTests(unittest.TestCase):
@@ -304,6 +368,104 @@ class HostLifecycleTests(unittest.TestCase):
         settings.write_text('video\n    resolution x = 1920\n')
         return scenario, save, settings
 
+    def test_runner_uses_direct_lifecycle_options_without_engine_url(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scenario, save, settings = self.fixture_inputs(root)
+            token_file = root / 'token'
+            token_file.write_text('a' * 64)
+            args = ['--host', '127.0.0.1', '--scenario', str(scenario),
+                    '--save', str(save), '--settings', str(settings),
+                    '--token-file', str(token_file)]
+            defaults = runner.parse_args(args)
+            self.assertEqual(defaults.loader_port, 9021)
+            self.assertEqual(defaults.lifecycle_port, 9138)
+            self.assertEqual(defaults.launcher_payload.name, 'benchmark-launcher.elf')
+            overridden = runner.parse_args(args + [
+                '--loader-port', '10021', '--lifecycle-port', '10138',
+                '--launcher-payload', str(root / 'custom.elf'),
+            ])
+            self.assertEqual((overridden.loader_port, overridden.lifecycle_port),
+                             (10021, 10138))
+            with self.assertRaises(SystemExit):
+                runner.parse_args(args + ['--engine-url', 'http://localhost'])
+    def test_console_game_start_waits_for_authenticated_runtime_ready(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            token_file = root / 'token'
+            token_file.write_text('a' * 64)
+            events = []
+            servers = []
+            delayed_start = []
+            with socket.socket() as probe:
+                probe.bind(('127.0.0.1', 0))
+                control_port = probe.getsockname()[1]
+
+            def launch(*args, **kwargs):
+                events.append(('launch',))
+                def start_control_service():
+                    time.sleep(0.05)
+                    servers.append(ControlSocketFixture([
+                        {'ready': False, 'game_state': 'starting'},
+                        {'ready': False, 'game_state': 'menu'},
+                    ], events, port=control_port))
+                thread = threading.Thread(target=start_control_service)
+                thread.start()
+                delayed_start.append(thread)
+                return {'title_id': 'PPSA99630',
+                        'launch_response': {'launch_result': 0},
+                        'process': {'running': True, 'pid': 81}}
+
+            try:
+                with patch.object(console_game, 'launch_title', side_effect=launch):
+                    result = console_game.main([
+                        'start', '--host', '127.0.0.1', '--token-file', str(token_file),
+                        '--control-port', str(control_port), '--timeout', '2',
+                        '--poll-interval', '0.005',
+                    ])
+            finally:
+                for thread in delayed_start:
+                    thread.join(timeout=2)
+                for server in servers:
+                    server.close()
+            self.assertEqual(result, 0)
+            self.assertLess(events.index(('launch',)), events.index(('game_state', 'menu')))
+            self.assertEqual(
+                [event for event in events if event[0] == 'game_state'],
+                [('game_state', 'starting'), ('game_state', 'menu')],
+            )
+            self.assertEqual(events.count(('control_connected',)), 1)
+            self.assertEqual([request['command'] for request in servers[0].requests],
+                             ['status', 'status'])
+
+    def test_console_game_stop_sends_normal_quit_before_waiting_for_absence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            token_file = root / 'token'
+            token_file.write_text('a' * 64)
+            events = []
+            server = ControlSocketFixture(
+                [{'ready': False, 'game_state': 'menu'}], events)
+
+            def wait_stopped(*args, **kwargs):
+                events.append(('stopped',))
+                return {'title_id': 'PPSA99630', 'stopped': True, 'process': None}
+
+            try:
+                with patch.object(console_game, 'title_status',
+                                  return_value={'running': True, 'pid': 81}), \
+                        patch.object(console_game, 'wait_for_title_stopped',
+                                     side_effect=wait_stopped):
+                    result = console_game.main([
+                        'stop', '--host', '127.0.0.1', '--token-file', str(token_file),
+                        '--control-port', str(server.port), '--timeout', '2',
+                    ])
+            finally:
+                server.close()
+            self.assertEqual(result, 0)
+            self.assertLess(events.index(('command', 'quit')), events.index(('stopped',)))
+            self.assertEqual(server.requests[0]['command'], 'quit')
+            self.assertEqual(server.requests[0]['token'], 'a' * 64)
     def frame_csv(self):
         header = ','.join(pacing.FRAME_FIELDS)
         row = '1,capture,1000000,20000000,3000000,5000000,100000,11900000,-1,0,0,1,1,2,3,0.1,0.2,0.3'
@@ -344,15 +506,16 @@ class HostLifecycleTests(unittest.TestCase):
             '/download0/benchmark/config/settings.cfg': settings_bytes,
         })
         runtime = RuntimeFixture(storage, events, self.frame_csv())
-        def launch_title(*args, **kwargs):
+        def launch_title(host, title_id, **kwargs):
+            events.append(('launch', host, title_id, kwargs['loader_port'],
+                           kwargs['lifecycle_port'], Path(kwargs['payload_path']).name))
             events.append(('launch',))
-            return {'engine_version': {'version': '8.5.1'}, 'title_id': 'PPSA99630',
-                    'launch_response': {'ok': True},
-                    'process': {'kind': 'app', 'title_id': 'PPSA99630'}}
-        def wait_for_title_stopped(*args, **kwargs):
+            return {'title_id': 'PPSA99630',
+                    'launch_response': {'launch_result': 0},
+                    'process': {'running': True, 'pid': 81}}
+        def wait_for_title_stopped(host, title_id, **kwargs):
             events.append(('process_stopped',))
-            return {'engine_version': {'version': '8.5.1'}, 'title_id': 'PPSA99630',
-                    'stopped': True, 'process': None}
+            return {'title_id': 'PPSA99630', 'stopped': True, 'process': None}
         adapter = types.SimpleNamespace(launch_title=launch_title,
                                         wait_for_title_stopped=wait_for_title_stopped)
         token_file = root / 'private-token'
@@ -394,10 +557,14 @@ class HostLifecycleTests(unittest.TestCase):
                              b'video\n    resolution x = 1920\n')
             self.assertEqual(json.loads(storage.files['/download0/config/benchmark.json'])
                              ['control']['token'], 'b' * 64)
+            launch_args = next(event for event in events
+                               if isinstance(event, tuple) and len(event) > 2 and event[0] == 'launch')
+            self.assertEqual(launch_args[1:5], ('127.0.0.1', 'PPSA99630', 9021, 9138))
+            self.assertEqual(launch_args[5], 'benchmark-launcher.elf')
 
     def test_automatic_repeats_wait_for_prior_title_stop(self):
         with tempfile.TemporaryDirectory() as temporary:
-            storage, events, output, _ = self.run_cli(Path(temporary), attach=False, repeat=2)
+            _, events, output, _ = self.run_cli(Path(temporary), attach=False, repeat=2)
             launches = [index for index, event in enumerate(events) if event == ('launch',)]
             stops = [index for index, event in enumerate(events) if event == ('process_stopped',)]
             self.assertEqual(len(launches), 2)

@@ -47,6 +47,9 @@ class RuntimeSocketTest(unittest.TestCase):
                 (root / "saves").mkdir()
                 (root / "scenarios").mkdir()
                 (root / "saves/fixture.omwsave").write_bytes(b"fixture save")
+                outside_save = root.with_name(root.name + "-outside.omwsave")
+                outside_save.write_bytes(b"outside save")
+                (root / "saves/escape.omwsave").symlink_to(outside_save)
                 token = secrets.token_hex(32)
                 port = 19137 + index
                 startup = "idle.json" if name == "startup_lifecycle" else ""
@@ -89,6 +92,16 @@ class RuntimeSocketTest(unittest.TestCase):
                             self.fail("runtime control socket did not become ready")
                     client = self.BenchmarkClient("127.0.0.1", port, token, timeout=2)
                     client.connect()
+                    if name == "complete":
+                        before_escape_attempt = client.status()
+                        escape_request = client.command("load_save", save="escape.omwsave")
+                        rejected_escape = client.wait_for(
+                            lambda value: value["last_command_id"] == escape_request["id"],
+                            deadline=time.monotonic() + 5, poll_interval=0.02,
+                        )
+                        self.assertEqual(rejected_escape["last_command_error"], "save_not_found")
+                        self.assertEqual(rejected_escape["loaded_save"], before_escape_attempt["loaded_save"])
+                        self.assertEqual(rejected_escape["ready"], before_escape_attempt["ready"])
 
                     if name == "startup_lifecycle":
                         status = client.wait_for(
@@ -153,6 +166,8 @@ class RuntimeSocketTest(unittest.TestCase):
                     if process.poll() is None:
                         process.terminate()
                         process.communicate(timeout=5)
+                    if outside_save.exists():
+                        outside_save.unlink()
 
 
 if __name__ == "__main__":

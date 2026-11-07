@@ -1,175 +1,216 @@
-"""Version-checked title launcher through the PS5Upload engine HTTP API."""
+"""Host-side client for the direct PS5 title lifecycle helper."""
+from __future__ import annotations
+
+import errno
 import json
+import math
+import socket
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
+from pathlib import Path
+
+SERVICE = "openmw-launcher"
+PROTOCOL_VERSION = 1
+TITLE_ID = "PPSA99630"
+DEFAULT_LOADER_PORT = 9021
+DEFAULT_LIFECYCLE_PORT = 9138
+DEFAULT_PAYLOAD_PATH = Path(__file__).resolve().parents[1] / "build" / "benchmark-launcher.elf"
+MAX_REPLY_BYTES = 4096
+UPLOAD_CHUNK_BYTES = 64 * 1024
 
 
 class LauncherError(RuntimeError):
-    """The engine could not safely launch or verify the requested title."""
+    """The direct lifecycle helper could not safely service the request."""
+
+def _positive_timeout(timeout_s, poll_interval_s=None):
+    if (not math.isfinite(timeout_s) or timeout_s <= 0 or
+            (poll_interval_s is not None and
+             (not math.isfinite(poll_interval_s) or poll_interval_s <= 0))):
+        raise LauncherError("timeout and poll interval must be positive and finite")
 
 
-def _request(engine_url, method, path, *, body=None, timeout_s):
-    url = engine_url.rstrip("/") + path
-    data = None if body is None else json.dumps(body).encode("utf-8")
-    headers = {"Accept": "application/json"}
-    if data is not None:
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_s) as response:
-            raw = response.read(4 * 1024 * 1024 + 1)
-            if len(raw) > 4 * 1024 * 1024:
-                raise LauncherError(f"PS5Upload response too large for {method} {path}")
-    except urllib.error.HTTPError as error:
-        raise LauncherError(f"PS5Upload returned HTTP {error.code} for {method} {path}") from error
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
-        raise LauncherError(f"PS5Upload request failed for {method} {path}") from error
-    try:
-        return json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise LauncherError(f"PS5Upload returned invalid JSON for {method} {path}") from error
-
-
-def _check_engine_api(engine_url, remaining_timeout):
-    version = _request(
-        engine_url, "GET", "/api/version", timeout_s=remaining_timeout()
-    )
-    if not isinstance(version, dict) or version.get("version") != "8.5.1":
-        actual = version.get("version") if isinstance(version, dict) else None
-        raise LauncherError(
-            f"PS5Upload engine version {actual!r} is unsupported; require 8.5.1"
-        )
-    return version
-
-
-def _app_process(status, title_id):
-    if not isinstance(status, dict) or not isinstance(status.get("processes"), list):
-        raise LauncherError("PS5Upload process list has no processes array")
-    if not isinstance(status.get("truncated"), bool):
-        raise LauncherError("PS5Upload process list has no valid truncated flag")
-
-    matching = None
-    for process in status["processes"]:
-        if not isinstance(process, dict):
-            raise LauncherError("PS5Upload process list contains a malformed row")
-        kind = process.get("kind")
-        if not isinstance(kind, str):
-            raise LauncherError("PS5Upload process row has no valid kind")
-        if kind != "app":
-            continue
-        process_title_id = process.get("title_id")
-        if not isinstance(process_title_id, str):
-            raise LauncherError("PS5Upload app process row has no valid title_id")
-        if process_title_id.casefold() == title_id.casefold():
-            matching = process
-
-    if matching is None and status["truncated"]:
-        raise LauncherError("PS5Upload process list was truncated; title status is unknown")
-    return matching
-
-
-def launch_title(engine_url, console_addr, title_id, *, timeout_s, poll_interval_s):
-    """Launch a registered native title and wait until its process is visible.
-
-    Returns a JSON-compatible dict with ``engine_version``, ``title_id``,
-    ``launch_response``, and the matching ``process`` row. Raises LauncherError
-    on API/schema failure, launch refusal, malformed status, or timeout. It
-    refuses to launch an already-running title and never retries the launch call.
-    """
-    if not engine_url or not console_addr or not title_id:
-        raise LauncherError("engine URL, console address, and title ID are required")
-    if timeout_s <= 0 or poll_interval_s <= 0:
-        raise LauncherError("timeout and poll interval must be positive")
-
+def _request(console_addr, lifecycle_port, command, timeout_s):
+    request = (command + "\n").encode("ascii")
     deadline = time.monotonic() + timeout_s
+    try:
+        with socket.create_connection((console_addr, lifecycle_port),
+                                      timeout=_remaining(deadline)) as conn:
+            conn.settimeout(_remaining(deadline))
+            conn.sendall(request)
+            raw = bytearray()
+            while len(raw) <= MAX_REPLY_BYTES:
+                conn.settimeout(_remaining(deadline))
+                part = conn.recv(min(1024, MAX_REPLY_BYTES + 1 - len(raw)))
+                if not part:
+                    break
+                raw.extend(part)
+                if b"\n" in part:
+                    break
+    except OSError as error:
+        raise LauncherError(f"lifecycle helper {command} request failed: {error}") from error
+    if not raw.endswith(b"\n") or raw.count(b"\n") != 1 or len(raw) > MAX_REPLY_BYTES:
+        raise LauncherError("lifecycle helper returned an unterminated or oversized reply")
+    try:
+        text = raw[:-1].decode("ascii")
+        reply = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise LauncherError("lifecycle helper returned invalid ASCII JSON") from error
+    if not isinstance(reply, dict):
+        raise LauncherError("lifecycle helper reply must be a JSON object")
+    if reply.get("service") != SERVICE:
+        raise LauncherError("unexpected lifecycle helper service")
+    if type(reply.get("protocol")) is not int or reply["protocol"] != PROTOCOL_VERSION:
+        raise LauncherError("unsupported lifecycle helper protocol")
+    if reply.get("title_id") != TITLE_ID:
+        raise LauncherError("lifecycle helper reported an unexpected title ID")
+    if type(reply.get("ok")) is not bool:
+        raise LauncherError("lifecycle helper reply lacks an ok boolean")
+    if not reply["ok"]:
+        message = reply.get("error")
+        code = reply.get("code")
+        if not isinstance(message, str):
+            message = "request was rejected"
+        if code is not None and (type(code) is not int):
+            raise LauncherError("lifecycle helper returned an invalid error code")
+        raise LauncherError(f"lifecycle helper rejected {command}: {message}")
+    if command == "STATUS":
+        if type(reply.get("running")) is not bool:
+            raise LauncherError("lifecycle helper status lacks a running boolean")
+        if type(reply.get("pid")) is not int or reply["pid"] < 0:
+            raise LauncherError("lifecycle helper status has an invalid process ID")
+        if not reply["running"] and reply["pid"] != 0:
+            raise LauncherError("lifecycle helper reports a PID for an absent title")
+        if reply["running"] and reply["pid"] == 0:
+            raise LauncherError("lifecycle helper reports a running title without a process ID")
+    elif command == "LAUNCH":
+        if type(reply.get("launch_result")) is not int:
+            raise LauncherError("lifecycle helper launch reply lacks an integer result")
+    return reply
 
-    def request_timeout():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise LauncherError("launcher deadline expired")
-        return min(remaining, 10.0)
 
-    engine_version = _check_engine_api(engine_url, request_timeout)
-    query = urllib.parse.urlencode({"addr": console_addr})
-    status_path = "/api/ps5/process/list?" + query
+def _is_connection_refused(error):
+    cause = error.__cause__
+    return isinstance(cause, OSError) and cause.errno == errno.ECONNREFUSED
 
-    status = _request(engine_url, "GET", status_path, timeout_s=request_timeout())
-    existing = _app_process(status, title_id)
-    if existing is not None:
-        raise LauncherError(
-            f"title {title_id} is already running; use attach mode instead of launching it"
-        )
 
-    launched = _request(
-        engine_url,
-        "POST",
-        "/api/ps5/app/launch",
-        body={"addr": console_addr, "title_id": title_id},
-        timeout_s=request_timeout(),
-    )
-    if not isinstance(launched, dict) or launched.get("ok") is not True:
-        raise LauncherError("PS5Upload did not confirm title launch")
+def _upload_payload(console_addr, payload_path, loader_port, timeout_s):
+    path = Path(payload_path)
+    deadline = time.monotonic() + timeout_s
+    try:
+        with path.open("rb") as source:
+            if source.read(4) != b"\x7fELF":
+                raise LauncherError(f"launcher payload is not an ELF file: {path}")
+            source.seek(0)
+            with socket.create_connection(
+                (console_addr, loader_port), timeout=_remaining(deadline)
+            ) as conn:
+                while True:
+                    chunk = source.read(UPLOAD_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    conn.settimeout(_remaining(deadline))
+                    conn.sendall(chunk)
+                conn.shutdown(socket.SHUT_WR)
+    except LauncherError:
+        raise
+    except OSError as error:
+        raise LauncherError(f"could not execute launcher ELF through the loader: {error}") from error
 
+
+def _remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise LauncherError("lifecycle deadline expired")
+    return remaining
+
+
+def ensure_helper(
+    console_addr,
+    *,
+    payload_path=DEFAULT_PAYLOAD_PATH,
+    loader_port=DEFAULT_LOADER_PORT,
+    lifecycle_port=DEFAULT_LIFECYCLE_PORT,
+    timeout_s,
+    poll_interval_s,
+):
+    """Return helper process status, bootstrapping only when its port is refused."""
+    if not console_addr:
+        raise LauncherError("console address is required")
+    _positive_timeout(timeout_s, poll_interval_s)
+    deadline = time.monotonic() + timeout_s
+    try:
+        return _request(console_addr, lifecycle_port, "STATUS", _remaining(deadline))
+    except LauncherError as error:
+        if not _is_connection_refused(error):
+            raise
+    _upload_payload(console_addr, payload_path, loader_port, _remaining(deadline))
     while True:
-        status = _request(engine_url, "GET", status_path, timeout_s=request_timeout())
-        matching = _app_process(status, title_id)
-        if matching is not None:
-            return {
-                "engine_version": engine_version,
-                "title_id": title_id,
-                "launch_response": launched,
-                "process": matching,
-            }
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise LauncherError(
-                f"title {title_id} was not visible in PS5Upload process list before timeout"
-            )
+        try:
+            return _request(console_addr, lifecycle_port, "STATUS", _remaining(deadline))
+        except LauncherError as error:
+            if not _is_connection_refused(error):
+                raise
+        remaining = _remaining(deadline)
+        time.sleep(min(poll_interval_s, remaining))
+
+
+def title_status(console_addr, *, lifecycle_port=DEFAULT_LIFECYCLE_PORT, timeout_s):
+    """Read authoritative process status from an already-running helper."""
+    if not console_addr:
+        raise LauncherError("console address is required")
+    _positive_timeout(timeout_s)
+    return _request(console_addr, lifecycle_port, "STATUS", timeout_s)
+
+
+def launch_title(
+    console_addr,
+    title_id,
+    *,
+    payload_path=DEFAULT_PAYLOAD_PATH,
+    loader_port=DEFAULT_LOADER_PORT,
+    lifecycle_port=DEFAULT_LIFECYCLE_PORT,
+    timeout_s,
+    poll_interval_s,
+):
+    """Launch once through the resident helper and wait for process visibility."""
+    if title_id != TITLE_ID:
+        raise LauncherError(f"this lifecycle helper supports only {TITLE_ID}")
+    _positive_timeout(timeout_s, poll_interval_s)
+    deadline = time.monotonic() + timeout_s
+    status = ensure_helper(
+        console_addr, payload_path=payload_path, loader_port=loader_port,
+        lifecycle_port=lifecycle_port, timeout_s=_remaining(deadline),
+        poll_interval_s=poll_interval_s,
+    )
+    if status["running"]:
+        raise LauncherError(f"lifecycle helper is already running as PID {status['pid']}")
+    # Do not retry this request: a lost reply leaves launch outcome ambiguous.
+    launched = _request(console_addr, lifecycle_port, "LAUNCH", _remaining(deadline))
+    while True:
+        status = _request(console_addr, lifecycle_port, "STATUS", _remaining(deadline))
+        if status["running"]:
+            return {"title_id": TITLE_ID, "launch_response": launched, "process": status}
+        remaining = _remaining(deadline)
         time.sleep(min(poll_interval_s, remaining))
 
 
 def wait_for_title_stopped(
-    engine_url, console_addr, title_id, *, timeout_s, poll_interval_s
+    console_addr,
+    title_id,
+    *,
+    lifecycle_port=DEFAULT_LIFECYCLE_PORT,
+    timeout_s,
+    poll_interval_s,
 ):
-    """Wait until a title has no matching app process in the v8.5.1 process list.
-
-    Returns a JSON-compatible dict with ``engine_version``, ``title_id``,
-    ``stopped: True``, and ``process: None``. Raises LauncherError if status is
-    malformed, the process list is truncated, the engine is incompatible, or
-    the deadline expires. This function only reads process status.
-    """
-    if not engine_url or not console_addr or not title_id:
-        raise LauncherError("engine URL, console address, and title ID are required")
-    if timeout_s <= 0 or poll_interval_s <= 0:
-        raise LauncherError("timeout and poll interval must be positive")
-
+    """Wait for helper-confirmed absence of the fixed title process."""
+    if title_id != TITLE_ID:
+        raise LauncherError(f"this lifecycle helper supports only {TITLE_ID}")
+    if not console_addr:
+        raise LauncherError("console address is required")
+    _positive_timeout(timeout_s, poll_interval_s)
     deadline = time.monotonic() + timeout_s
-
-    def request_timeout():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise LauncherError("launcher deadline expired")
-        return min(remaining, 10.0)
-
-    engine_version = _check_engine_api(engine_url, request_timeout)
-    query = urllib.parse.urlencode({"addr": console_addr})
-    status_path = "/api/ps5/process/list?" + query
-
     while True:
-        status = _request(engine_url, "GET", status_path, timeout_s=request_timeout())
-        matching = _app_process(status, title_id)
-        if matching is None:
-            return {
-                "engine_version": engine_version,
-                "title_id": title_id,
-                "stopped": True,
-                "process": None,
-            }
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise LauncherError(
-                f"title {title_id} remained visible in PS5Upload process list before timeout"
-            )
+        status = _request(console_addr, lifecycle_port, "STATUS", _remaining(deadline))
+        if not status["running"]:
+            return {"title_id": TITLE_ID, "stopped": True, "process": None}
+        remaining = _remaining(deadline)
         time.sleep(min(poll_interval_s, remaining))

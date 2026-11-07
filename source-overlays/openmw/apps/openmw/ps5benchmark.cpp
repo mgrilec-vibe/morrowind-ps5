@@ -956,12 +956,14 @@ namespace
 
     bool containedRegularSave(const std::string& save)
     {
+        // Names are validated before queuing or parsing a scenario. PS5 denies
+        // realpath in the title sandbox, so inspect entries without following links.
         std::error_code ec;
-        const auto root = std::filesystem::canonical(g.workspace / "saves", ec);
-        if (ec) return false;
-        const auto candidate = std::filesystem::canonical(root / save, ec);
-        if (ec || !std::filesystem::is_regular_file(candidate, ec) || ec) return false;
-        return candidate.parent_path() == root;
+        const auto root = g.workspace / "saves";
+        const auto rootStatus = std::filesystem::symlink_status(root, ec);
+        if (ec || !std::filesystem::is_directory(rootStatus)) return false;
+        const auto candidateStatus = std::filesystem::symlink_status(root / save, ec);
+        return !ec && std::filesystem::is_regular_file(candidateStatus);
     }
 
     void clearInput();

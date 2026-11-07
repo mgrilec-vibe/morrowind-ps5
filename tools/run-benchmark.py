@@ -370,9 +370,10 @@ def _run_one(args, token, scenario, scenario_bytes, save_path, settings_bytes,
     scenario_started = False
     try:
         if not args.attach:
-            launch = launch_callback(args.engine_url, args.host, TITLE_ID,
-                                     timeout_s=args.operation_timeout,
-                                     poll_interval_s=args.poll_interval)
+            launch = launch_callback(
+                args.host, TITLE_ID, payload_path=args.launcher_payload,
+                loader_port=args.loader_port, lifecycle_port=args.lifecycle_port,
+                timeout_s=args.operation_timeout, poll_interval_s=args.poll_interval)
             owns_title = True
 
         client = BenchmarkClient(args.host, args.control_port, token,
@@ -537,10 +538,10 @@ def _run_one(args, token, scenario, scenario_bytes, save_path, settings_bytes,
                 client.command('quit')
                 from tools.benchmark_launcher import wait_for_title_stopped
                 stopped = wait_for_title_stopped(
-                    args.engine_url, args.host, TITLE_ID,
+                    args.host, TITLE_ID, lifecycle_port=args.lifecycle_port,
                     timeout_s=args.operation_timeout, poll_interval_s=args.poll_interval)
                 if stopped.get('stopped') is not True:
-                    raise BenchmarkError('launcher did not confirm title process stopped')
+                    raise BenchmarkError('lifecycle helper did not confirm title process stopped')
             except Exception as error:
                 cleanup_errors.append(f'normal quit/process stop: {error}')
         if storage is not None:
@@ -579,7 +580,10 @@ def parse_args(argv=None):
     parser.add_argument('--token-file', type=Path,
                         default=Path.home() / '.config/openmw-ps5-benchmark/token',
                         help='Private file for the generated 32+ hexadecimal runtime token')
-    parser.add_argument('--engine-url', default='http://127.0.0.1:19113', help='Paired PS5Upload 8.5.1 engine API URL')
+    from benchmark_launcher import DEFAULT_LIFECYCLE_PORT, DEFAULT_LOADER_PORT, DEFAULT_PAYLOAD_PATH
+    parser.add_argument('--loader-port', type=int, default=DEFAULT_LOADER_PORT)
+    parser.add_argument('--lifecycle-port', type=int, default=DEFAULT_LIFECYCLE_PORT)
+    parser.add_argument('--launcher-payload', type=Path, default=DEFAULT_PAYLOAD_PATH)
     parser.add_argument('--ftp-port', type=int, default=2121)
     parser.add_argument('--ftp-user', default='anonymous')
     parser.add_argument('--ftp-password', default='benchmark')
@@ -601,8 +605,9 @@ def parse_args(argv=None):
         parser.error('--prepare and --attach support one run')
     if args.max_frames < 1 or args.max_frames > 36000:
         parser.error('--max-frames must be between 1 and 36000')
-    if not 1 <= args.ftp_port <= 65535 or not 1 <= args.control_port <= 65535:
-        parser.error('FTP and control ports must be between 1 and 65535')
+    if (not 1 <= args.ftp_port <= 65535 or not 1 <= args.control_port <= 65535 or
+            not 1 <= args.loader_port <= 65535 or not 1 <= args.lifecycle_port <= 65535):
+        parser.error('FTP, control, loader, and lifecycle ports must be between 1 and 65535')
     if (not math.isfinite(args.operation_timeout) or args.operation_timeout <= 0 or
             args.operation_timeout > MAX_OPERATION_TIMEOUT):
         parser.error('--operation-timeout must be between 0 and 7200 seconds')

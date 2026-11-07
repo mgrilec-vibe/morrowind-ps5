@@ -58,6 +58,18 @@ Several build scripts expect the SDK’s default layout shown above. On a differ
 
 The folder title is generated at `build/package/dist/PPSA99630`. Supply your own game data only for console testing; keep it outside source control and release packages. Detailed profiling and HD texture flags are off for the release.
 
+## Direct lifecycle helper
+
+The host tools can start and stop PPSA99630 without a PS5Upload engine. Build the resident helper as a standard SDK ELF payload, not as a native title:
+
+```sh
+python3 tools/build-benchmark-launcher.py
+```
+
+The script uses the installed public PS5 payload SDK and writes `build/benchmark-launcher.elf`. `tools/run-benchmark.py` and `tools/console-game.py` use this path by default; set `--launcher-payload` to select another build. The host uploads the raw ELF to the loader on TCP 9021 only when the lifecycle service on TCP 9138 refuses the connection. The loader port has no authentication. Restrict it and the helper port to a trusted LAN.
+
+The helper uses the SDK's process enumeration and native launch interface for the fixed registered title PPSA99630. The title must already be installed and registered. The helper's launch call can fail due to console caller context; the host reports that failure and does not fall back to PS5Upload. Building or host-testing the ELF does not validate native launch or shutdown on console hardware.
+
 ## Host checks
 
 ```sh

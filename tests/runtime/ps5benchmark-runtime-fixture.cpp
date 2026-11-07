@@ -1,10 +1,17 @@
 #include "ps5benchmark.hpp"
 
+#include <cerrno>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
 #include <string>
 #include <thread>
+
+extern "C" char* realpath(const char*, char*) noexcept
+{
+    errno = EPERM;
+    return nullptr;
+}
 
 int main(int argc, char** argv)
 {
